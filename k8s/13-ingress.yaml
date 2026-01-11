@@ -1,0 +1,84 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: linkshortener-ingress
+  namespace: linkshortener
+  labels:
+    app: linkshortener
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+spec:
+  ingressClassName: nginx
+  
+  rules:
+  - host: linkshortener.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: linkshortener-frontend
+            port:
+              number: 80
+      
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: linkshortener-backend
+            port:
+              number: 3000
+  
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: linkshortener-network-policy
+  namespace: linkshortener
+spec:
+  podSelector:
+    matchLabels:
+      app: linkshortener-backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-frontend
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-db
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53

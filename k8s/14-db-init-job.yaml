@@ -1,0 +1,148 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: linkshortener-db-init
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db-init
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: linkshortener-db-init
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z linkshortener-db 5432; do echo waiting for db; sleep 2; done;']
+      
+      containers:
+      - name: db-init
+        image: postgres:15-alpine
+        env:
+        - name: PGHOST
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_HOST
+        - name: PGPORT
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_PORT
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_DB
+        
+        command:
+        - /bin/sh
+        - -c
+        - |
+          psql << 'EOF'
+          -- Таблица за users
+          CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            subscription_level VARCHAR(50) DEFAULT 'free' CHECK (subscription_level IN ('free', 'pro', 'enterprise')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+
+          -- Index за бързо търсене по email
+          CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+          -- Таблица за links
+          CREATE TABLE IF NOT EXISTS links (
+            id SERIAL PRIMARY KEY,
+            original_url TEXT NOT NULL,
+            short_code VARCHAR(10) UNIQUE NOT NULL,
+            custom_alias VARCHAR(50) UNIQUE,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP,
+            clicks_count INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT true
+          );
+
+          -- Indexes за бързи queries
+          CREATE INDEX IF NOT EXISTS idx_links_short_code ON links(short_code);
+          CREATE INDEX IF NOT EXISTS idx_links_custom_alias ON links(custom_alias);
+          CREATE INDEX IF NOT EXISTS idx_links_user_id ON links(user_id);
+          CREATE INDEX IF NOT EXISTS idx_links_created_at ON links(created_at DESC);
+
+          -- Таблица за clicks analytics
+          CREATE TABLE IF NOT EXISTS clicks (
+            id SERIAL PRIMARY KEY,
+            link_id INTEGER REFERENCES links(id) ON DELETE CASCADE,
+            clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ip_address_hash VARCHAR(64),  -- SHA256 hash за privacy
+            user_agent TEXT,
+            referer TEXT,
+            country VARCHAR(2),
+            city VARCHAR(100)
+          );
+
+          -- Indexes за analytics queries
+          CREATE INDEX IF NOT EXISTS idx_clicks_link_id ON clicks(link_id);
+          CREATE INDEX IF NOT EXISTS idx_clicks_clicked_at ON clicks(clicked_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_clicks_link_date ON clicks(link_id, clicked_at DESC);
+
+          -- Function за автоматичен update на clicks_count
+          CREATE OR REPLACE FUNCTION increment_clicks_count()
+          RETURNS TRIGGER AS $$
+          BEGIN
+            UPDATE links SET clicks_count = clicks_count + 1 WHERE id = NEW.link_id;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          -- Trigger за автоматично инкрементиране на clicks
+          DROP TRIGGER IF EXISTS trigger_increment_clicks ON clicks;
+          CREATE TRIGGER trigger_increment_clicks
+          AFTER INSERT ON clicks
+          FOR EACH ROW
+          EXECUTE FUNCTION increment_clicks_count();
+
+          -- Function за updated_at timestamp
+          CREATE OR REPLACE FUNCTION update_updated_at_column()
+          RETURNS TRIGGER AS $$
+          BEGIN
+            NEW.updated_at = CURRENT_TIMESTAMP;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          -- Trigger за users updated_at
+          DROP TRIGGER IF EXISTS trigger_users_updated_at ON users;
+          CREATE TRIGGER trigger_users_updated_at
+          BEFORE UPDATE ON users
+          FOR EACH ROW
+          EXECUTE FUNCTION update_updated_at_column();
+
+          -- Създаване на test user (optional за development)
+          INSERT INTO users (email, password_hash, subscription_level)
+          VALUES ('test@example.com', '\$2b\$10\$XqZ7vZKZyJ8KpZJxF4B7/.YqZ7vZKZyJ8KpZJxF4B7', 'free')
+          ON CONFLICT (email) DO NOTHING;
+
+          GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO linkshortener_user;
+          GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO linkshortener_user;
+
+          SELECT 'Database initialization completed successfully!' as status;
+          EOF
+      
+      restartPolicy: Never

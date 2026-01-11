@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: linkshortener-db-pvc
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

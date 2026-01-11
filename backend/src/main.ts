@@ -1,18 +1,12 @@
-// ============================================
-// src/main.ts
-// ============================================
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  app.enableCors({
-    origin: 'http://localhost:8000',
-    credentials: true,
-  });
-
+  // Global validation pipe
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -21,11 +15,29 @@ async function bootstrap() {
     }),
   );
 
+  // CORS configuration
+  app.enableCors({
+    origin: process.env.FRONTEND_URL || '*',
+    credentials: true,
+  });
+
+  // Global prefix
   app.setGlobalPrefix('api');
 
-  const port = 3000;
-  await app.listen(port, '0.0.0.0');
+  // Swagger documentation
+  const config = new DocumentBuilder()
+    .setTitle('Link Shortener API')
+    .setDescription('API for URL shortening service with subscription tiers')
+    .setVersion('1.0')
+    .addBearerAuth()
+    .build();
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('api/docs', app, document);
 
-  console.log(`Application is running on: http://localhost:${port}`);
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  console.log(`🚀 Application is running on: http://localhost:${port}`);
+  console.log(`📚 Swagger docs available at: http://localhost:${port}/api/docs`);
 }
+
 bootstrap();

@@ -1,0 +1,879 @@
+# Namespace за изолация на всички ресурси на link shortener проекта
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: linkshortener
+  labels:
+    name: linkshortener
+    environment: development---
+# Secret за съхранение на чувствителни данни (DB credentials, JWT secret)
+# ВАЖНО: В production тези стойности трябва да са base64 encoded и да се управляват сигурно
+apiVersion: v1
+kind: Secret
+metadata:
+  name: linkshortener-secrets
+  namespace: linkshortener
+type: Opaque
+stringData:
+  POSTGRES_USER: linkshortener_user
+  POSTGRES_PASSWORD: SuperSecurePassword123!
+  POSTGRES_DB: linkshortener_db
+  
+  JWT_SECRET: eW91ci1zdXBlci1zZWNyZXQtand0LWtleS1jaGFuZ2UtdGhpcy1pbi1wcm9kdWN0aW9uCg==
+  
+  REDIS_PASSWORD: ""
+# ConfigMap за не-чувствителни environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkshortener-config
+  namespace: linkshortener
+data:
+  # Backend configuration
+  NODE_ENV: "development"
+  PORT: "3000"
+  
+  # Database connection (host и port, без credentials)
+  DB_HOST: "linkshortener-db"
+  DB_PORT: "5432"
+  
+  # Redis connection
+  REDIS_HOST: "linkshortener-redis"
+  REDIS_PORT: "6379"
+  
+  # JWT configuration
+  JWT_EXPIRATION: "7d"
+  
+  # Rate limiting configuration
+  RATE_LIMIT_WINDOW: "900000"  # 15 minutes in ms
+  RATE_LIMIT_MAX_REQUESTS: "100"
+  
+  # Subscription tier limits (JSON format)
+  SUBSCRIPTION_LIMITS: |
+    {
+      "free": {
+        "maxLinks": 10,
+        "maxCustomAliases": 2,
+        "analyticsRetentionDays": 7,
+        "rateLimitPerMinute": 10
+      },
+      "pro": {
+        "maxLinks": 1000,
+        "maxCustomAliases": 100,
+        "analyticsRetentionDays": 90,
+        "rateLimitPerMinute": 100
+      },
+      "enterprise": {
+        "maxLinks": -1,
+        "maxCustomAliases": -1,
+        "analyticsRetentionDays": 365,
+        "rateLimitPerMinute": 1000
+      }
+    }
+  
+  REACT_APP_API_URL: "http://linkshortener-backend:3000"---
+# PersistentVolumeClaim за PostgreSQL за да запазваме данни при рестарт
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: linkshortener-db-pvc
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db
+spec:
+  # Minikube поддържа dynamic provisioning с default storage class
+  accessModes:
+    - ReadWriteOnce  # Само един pod може да пише едновременно
+  resources:
+    requests:
+      storage: 5Gi  # 5GB storage за database
+  # storageClassName може да се пропусне за да използва default в Minikube---
+# PostgreSQL Deployment - основната база данни за съхранение на users, links и clicks
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkshortener-db
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db
+    tier: database
+spec:
+  # Един pod за PostgreSQL (StatefulSet би бил по-добър за production)
+  replicas: 1
+  selector:
+    matchLabels:
+      app: linkshortener-db
+  # Strategy за update - Recreate защото имаме persistent volume
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: linkshortener-db
+        tier: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine  # Alpine версия за по-малък image size
+        ports:
+        - containerPort: 5432
+          name: postgres
+        # Environment variables от Secret
+        env:
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_PASSWORD
+        # Health checks
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - linkshortener_user
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - linkshortener_user
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        # Volume mount за persistent storage
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+          # Subpath за да избегнем проблеми с permissions
+          subPath: postgres
+        # Resource limits
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: linkshortener-db-pvc---
+# Service за PostgreSQL - ClusterIP защото е достъпна само вътре в cluster-а
+apiVersion: v1
+kind: Service
+metadata:
+  name: linkshortener-db
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db
+spec:
+  type: ClusterIP  # Само internal access
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+    name: postgres
+  selector:
+    app: linkshortener-db  # Селектира pods от Deployment-а---
+# Redis Deployment - за caching и rate limiting
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkshortener-redis
+  namespace: linkshortener
+  labels:
+    app: linkshortener-redis
+    tier: cache
+spec:
+  replicas: 1  # Един instance за development (за production - Redis Cluster или Sentinel)
+  selector:
+    matchLabels:
+      app: linkshortener-redis
+  template:
+    metadata:
+      labels:
+        app: linkshortener-redis
+        tier: cache
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine  # Alpine за по-малък size
+        ports:
+        - containerPort: 6379
+          name: redis
+        # Redis command за стартиране (optional password protection)
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"  # Persistence mode за по-добра durability
+        # Health checks
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        # Resource limits
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        # Volume за Redis persistence (optional за development)
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}  # Temporary storage (за production използвай PVC)---
+# Service за Redis - ClusterIP за internal access
+apiVersion: v1
+kind: Service
+metadata:
+  name: linkshortener-redis
+  namespace: linkshortener
+  labels:
+    app: linkshortener-redis
+spec:
+  type: ClusterIP  # Само internal communication
+  ports:
+  - port: 6379
+    targetPort: 6379
+    protocol: TCP
+    name: redis
+  selector:
+    app: linkshortener-redis---
+# Backend Deployment - NestJS API за link shortening, auth и analytics
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkshortener-backend
+  namespace: linkshortener
+  labels:
+    app: linkshortener-backend
+    tier: application
+spec:
+  # Два replicas за high availability (може да се scale-не)
+  replicas: 2
+  selector:
+    matchLabels:
+      app: linkshortener-backend
+  # Rolling update strategy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: linkshortener-backend
+        tier: application
+    spec:
+      # Init container за да чака database да е ready
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z linkshortener-db 5432; do echo waiting for db; sleep 2; done;']
+      
+      containers:
+      - name: backend
+        # ЗАБЕЛЕЖКА: Това е placeholder image - трябва да build-неш и push-неш собствен image
+        # Например: your-registry/linkshortener-backend:latest
+        image: rangelovkiril/linkshortener-backend:latest
+
+        ports:
+        - containerPort: 3000
+          name: http
+        
+        # Environment variables от ConfigMap и Secret
+        env:
+        # От ConfigMap
+        - name: NODE_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: NODE_ENV
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: PORT
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_HOST
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_PORT
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: REDIS_PORT
+        - name: JWT_EXPIRATION
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: JWT_EXPIRATION
+        - name: RATE_LIMIT_WINDOW
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: RATE_LIMIT_WINDOW
+        - name: RATE_LIMIT_MAX_REQUESTS
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: RATE_LIMIT_MAX_REQUESTS
+        - name: SUBSCRIPTION_LIMITS
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: SUBSCRIPTION_LIMITS
+        
+        # От Secret
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_DB
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: JWT_SECRET
+        
+        # Построяваме DATABASE_URL за TypeORM/Prisma
+        - name: DATABASE_URL
+          value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(POSTGRES_DB)"
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 3
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      
+      # Restart policy
+      restartPolicy: Always---
+# Service за Backend - NodePort за external access в Minikube
+apiVersion: v1
+kind: Service
+metadata:
+  name: linkshortener-backend
+  namespace: linkshortener
+  labels:
+    app: linkshortener-backend
+spec:
+  type: NodePort  # NodePort за достъп от host machine в Minikube
+  ports:
+  - port: 3000        # Port вътре в cluster
+    targetPort: 3000  # Port на container-а
+    nodePort: 30001   # External port (30000-32767 range)
+    protocol: TCP
+    name: http
+  selector:
+    app: linkshortener-backend  # Load balance между всички backend pods
+  # Session affinity за sticky sessions (optional)
+  sessionAffinity: ClientIP---
+# Frontend Deployment - React + TypeScript UI за link management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkshortener-frontend
+  namespace: linkshortener
+  labels:
+    app: linkshortener-frontend
+    tier: frontend
+spec:
+  replicas: 2  # Два replicas за availability
+  selector:
+    matchLabels:
+      app: linkshortener-frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: linkshortener-frontend
+        tier: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: rangelovkiril/linkshortener-frontend:latest
+        
+        ports:
+        - containerPort: 80
+          name: http
+        
+        # Environment variable за API URL (inject-ва се в build time или runtime)
+        env:
+        - name: REACT_APP_API_URL
+          # За Minikube използвай: http://<minikube-ip>:30001
+          # Може да се получи с: minikube service linkshortener-backend --url
+          value: "http://linkshortener-backend:3000"
+        
+        # Health checks за nginx
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        
+        # Volume mount за nginx config (optional)
+        # volumeMounts:
+        # - name: nginx-config
+        #   mountPath: /etc/nginx/conf.d/default.conf
+        #   subPath: default.conf
+      
+      # volumes:
+      # - name: nginx-config
+      #   configMap:
+      #     name: nginx-config---
+# Service за Frontend - NodePort за external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: linkshortener-frontend
+  namespace: linkshortener
+  labels:
+    app: linkshortener-frontend
+spec:
+  type: NodePort  # NodePort за директен достъп в Minikube
+  ports:
+  - port: 80          # Port вътре в cluster
+    targetPort: 80    # Port на nginx container
+    nodePort: 30000   # External port - достъпен на http://<minikube-ip>:30000
+    protocol: TCP
+    name: http
+  selector:
+    app: linkshortener-frontend  # Load balance между frontend pods---
+# Ingress за routing на HTTP traffic (optional - алтернатива на NodePort)
+# За да работи в Minikube, трябва да enable-неш ingress addon:
+# minikube addons enable ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: linkshortener-ingress
+  namespace: linkshortener
+  labels:
+    app: linkshortener
+  annotations:
+    # Nginx ingress specific annotations
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # CORS settings за frontend-backend communication
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+spec:
+  # IngressClassName за nginx (default в Minikube)
+  ingressClassName: nginx
+  
+  rules:
+  # Frontend routing - главна страница
+  - host: linkshortener.local  # Добави в /etc/hosts: <minikube-ip> linkshortener.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: linkshortener-frontend
+            port:
+              number: 80
+      
+      # Backend API routing - всички /api/* requests
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: linkshortener-backend
+            port:
+              number: 3000
+  
+  # Alternative: използвай различни hostnames
+  # - host: api.linkshortener.local
+  #   http:
+  #     paths:
+  #     - path: /
+  #       pathType: Prefix
+  #       backend:
+  #         service:
+  #           name: linkshortener-backend
+  #           port:
+  #             number: 3000
+
+---
+# NetworkPolicy за допълнителна сигурност (optional)
+# Ограничава network traffic между pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: linkshortener-network-policy
+  namespace: linkshortener
+spec:
+  # Policy за backend pods
+  podSelector:
+    matchLabels:
+      app: linkshortener-backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Backend приема traffic от frontend и ingress
+  - from:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-frontend
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx  # Ingress controller namespace
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  # Backend може да комуникира с DB и Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-db
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: linkshortener-redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Разреши DNS queries
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53---
+# Job за инициализация на database schema
+# Това е one-time job, който създава таблиците при първи deploy
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: linkshortener-db-init
+  namespace: linkshortener
+  labels:
+    app: linkshortener-db-init
+spec:
+  # Job ще се опита 3 пъти ако fail-не
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: linkshortener-db-init
+    spec:
+      # Init container за да чака DB да е ready
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z linkshortener-db 5432; do echo waiting for db; sleep 2; done;']
+      
+      containers:
+      - name: db-init
+        # Използваме postgres client за да execute SQL
+        image: postgres:15-alpine
+        env:
+        - name: PGHOST
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_HOST
+        - name: PGPORT
+          valueFrom:
+            configMapKeyRef:
+              name: linkshortener-config
+              key: DB_PORT
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: linkshortener-secrets
+              key: POSTGRES_DB
+        
+        # SQL commands за създаване на schema
+        command:
+        - /bin/sh
+        - -c
+        - |
+          psql << 'EOF'
+          -- Таблица за users
+          CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            subscription_level VARCHAR(50) DEFAULT 'free' CHECK (subscription_level IN ('free', 'pro', 'enterprise')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+
+          -- Index за бързо търсене по email
+          CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+          -- Таблица за links
+          CREATE TABLE IF NOT EXISTS links (
+            id SERIAL PRIMARY KEY,
+            original_url TEXT NOT NULL,
+            short_code VARCHAR(10) UNIQUE NOT NULL,
+            custom_alias VARCHAR(50) UNIQUE,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP,
+            clicks_count INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT true
+          );
+
+          -- Indexes за бързи queries
+          CREATE INDEX IF NOT EXISTS idx_links_short_code ON links(short_code);
+          CREATE INDEX IF NOT EXISTS idx_links_custom_alias ON links(custom_alias);
+          CREATE INDEX IF NOT EXISTS idx_links_user_id ON links(user_id);
+          CREATE INDEX IF NOT EXISTS idx_links_created_at ON links(created_at DESC);
+
+          -- Таблица за clicks analytics
+          CREATE TABLE IF NOT EXISTS clicks (
+            id SERIAL PRIMARY KEY,
+            link_id INTEGER REFERENCES links(id) ON DELETE CASCADE,
+            clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ip_address_hash VARCHAR(64),  -- SHA256 hash за privacy
+            user_agent TEXT,
+            referer TEXT,
+            country VARCHAR(2),
+            city VARCHAR(100)
+          );
+
+          -- Indexes за analytics queries
+          CREATE INDEX IF NOT EXISTS idx_clicks_link_id ON clicks(link_id);
+          CREATE INDEX IF NOT EXISTS idx_clicks_clicked_at ON clicks(clicked_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_clicks_link_date ON clicks(link_id, clicked_at DESC);
+
+          -- Function за автоматичен update на clicks_count
+          CREATE OR REPLACE FUNCTION increment_clicks_count()
+          RETURNS TRIGGER AS $$
+          BEGIN
+            UPDATE links SET clicks_count = clicks_count + 1 WHERE id = NEW.link_id;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          -- Trigger за автоматично инкрементиране на clicks
+          DROP TRIGGER IF EXISTS trigger_increment_clicks ON clicks;
+          CREATE TRIGGER trigger_increment_clicks
+          AFTER INSERT ON clicks
+          FOR EACH ROW
+          EXECUTE FUNCTION increment_clicks_count();
+
+          -- Function за updated_at timestamp
+          CREATE OR REPLACE FUNCTION update_updated_at_column()
+          RETURNS TRIGGER AS $$
+          BEGIN
+            NEW.updated_at = CURRENT_TIMESTAMP;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          -- Trigger за users updated_at
+          DROP TRIGGER IF EXISTS trigger_users_updated_at ON users;
+          CREATE TRIGGER trigger_users_updated_at
+          BEFORE UPDATE ON users
+          FOR EACH ROW
+          EXECUTE FUNCTION update_updated_at_column();
+
+          -- Създаване на test user (optional за development)
+          INSERT INTO users (email, password_hash, subscription_level)
+          VALUES ('test@example.com', '\$2b\$10\$XqZ7vZKZyJ8KpZJxF4B7/.YqZ7vZKZyJ8KpZJxF4B7', 'free')
+          ON CONFLICT (email) DO NOTHING;
+
+          GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO linkshortener_user;
+          GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO linkshortener_user;
+
+          SELECT 'Database initialization completed successfully!' as status;
+          EOF
+      
+      # Job приключва след успешно изпълнение
+      restartPolicy: Never---
+# HorizontalPodAutoscaler за backend - автоматично scaling при голям traffic
+# ЗАБЕЛЕЖКА: Изисква metrics-server в Minikube
+# Enable с: minikube addons enable metrics-server
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: linkshortener-backend-hpa
+  namespace: linkshortener
+  labels:
+    app: linkshortener-backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: linkshortener-backend
+  
+  # Минимален и максимален брой pods
+  minReplicas: 2
+  maxReplicas: 10
+  
+  # Metrics за scaling decisions
+  metrics:
+  # CPU utilization - scale при > 70%
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  
+  # Memory utilization - scale при > 80%
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  
+  # Behavior за по-гладко scaling
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Чака 5 минути преди scale down
+      policies:
+      - type: Percent
+        value: 50  # Намалява с макс 50% pods наведнъж
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Бързо scale up при нужда
+      policies:
+      - type: Percent
+        value: 100  # Удвоява pods при нужда
+        periodSeconds: 60
+      - type: Pods
+        value: 2  # Или добавя 2 pods
+        periodSeconds: 60
+      selectPolicy: Max  # Използва по-агресивната политика
+
+---
+# HorizontalPodAutoscaler за frontend
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: linkshortener-frontend-hpa
+  namespace: linkshortener
+  labels:
+    app: linkshortener-frontend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: linkshortener-frontend
+  
+  minReplicas: 2
+  maxReplicas: 5
+  
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+  
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
